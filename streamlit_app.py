@@ -8,7 +8,21 @@ import re
 import os
 import io
 import platform
+import time
+import logging
 from typing import Optional, Dict, Any
+from urllib.parse import quote
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('teams_fetcher.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # Set page config
 st.set_page_config(
@@ -30,6 +44,7 @@ def clean_teams_message(html_content: str) -> str:
 
 def get_access_token(tenant_id: str, client_id: str, client_secret: str) -> str:
     """Get Microsoft Graph API access token."""
+    logger.info(f"Attempting to get access token for tenant: {tenant_id[:8]}...")
     url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
     data = {
         "grant_type": "client_credentials",
@@ -41,9 +56,12 @@ def get_access_token(tenant_id: str, client_id: str, client_secret: str) -> str:
     try:
         response = requests.post(url, data=data)
         if response.status_code != 200:
+            logger.error(f"Failed to get token: {response.status_code}, {response.text}")
             raise Exception(f"Failed to get token: {response.status_code}, {response.text}")
+        logger.info("Successfully obtained access token")
         return response.json()["access_token"]
     except Exception as e:
+        logger.error(f"Authentication failed: {str(e)}")
         st.error(f"Authentication failed: {str(e)}")
         return None
 
@@ -54,58 +72,229 @@ def get_graph_headers(token: str) -> Dict[str, str]:
         "Content-Type": "application/json"
     }
 
-def fetch_replies_done(headers: Dict[str, str], team_id: str, channel_id: str, message_id: str) -> Optional[Dict[str, Any]]:
-    """Fetch replies to check for 'done' messages."""
-    url = f"https://graph.microsoft.com/v1.0/teams/{team_id}/channels/{channel_id}/messages/{message_id}/replies"
+def validate_teams_access(headers: Dict[str, str], team_id: str, channel_id: str) -> Dict[str, Any]:
+    """Validate access to Teams and Channels."""
+    logger.info(f"Validating Teams access for Team: {team_id[:8]}..., Channel: {channel_id[:20]}...")
+    results = {
+        "team_accessible": False,
+        "channel_accessible": False,
+        "messages_accessible": False,
+        "errors": []
+    }
+    
+    # URL encode channel ID
+    encoded_channel_id = quote(channel_id, safe='')
+    
+    # Test 1: Check if we can access the team
+    try:
+        team_url = f"https://graph.microsoft.com/v1.0/teams/{team_id}"
+        logger.info(f"Testing team access: {team_url}")
+        resp = requests.get(team_url, headers=headers)
+        if resp.status_code == 200:
+            results["team_accessible"] = True
+            team_name = resp.json().get("displayName", "Unknown")
+            logger.info(f"Team accessible: {team_name}")
+            st.success(f"✅ Team accessible: {team_name}")
+        else:
+            error_msg = f"Team not accessible: {resp.status_code}"
+            logger.error(error_msg)
+            results["errors"].append(error_msg)
+            st.error(f"❌ Cannot access team: {resp.status_code}")
+    except Exception as e:
+        error_msg = f"Team check failed: {str(e)}"
+        logger.error(error_msg)
+        results["errors"].append(error_msg)
+        st.error(f"❌ Team check error: {str(e)}")
+    
+    # Test 2: Check if we can access the channel
+    try:
+        channel_url = f"https://graph.microsoft.com/v1.0/teams/{team_id}/channels/{encoded_channel_id}"
+        logger.info(f"Testing channel access: {channel_url}")
+        resp = requests.get(channel_url, headers=headers)
+        if resp.status_code == 200:
+            results["channel_accessible"] = True
+            channel_name = resp.json().get("displayName", "Unknown")
+            logger.info(f"Channel accessible: {channel_name}")
+            st.success(f"✅ Channel accessible: {channel_name}")
+        else:
+            error_msg = f"Channel not accessible: {resp.status_code}"
+            logger.error(f"{error_msg} - {resp.text[:200]}")
+            results["errors"].append(error_msg)
+            st.error(f"❌ Cannot access channel: {resp.status_code} - {resp.text[:200]}")
+    except Exception as e:
+        error_msg = f"Channel check failed: {str(e)}"
+        logger.error(error_msg)
+        results["errors"].append(error_msg)
+        st.error(f"❌ Channel check error: {str(e)}")
+    
+    # Test 3: Check if we can access messages
+    try:
+        msg_url = f"https://graph.microsoft.com/v1.0/teams/{team_id}/channels/{encoded_channel_id}/messages"
+        logger.info(f"Testing messages access: {msg_url}")
+        resp = requests.get(msg_url, headers=headers)
+        if resp.status_code == 200:
+            results["messages_accessible"] = True
+            msg_count = len(resp.json().get("value", []))
+            logger.info(f"Messages accessible, sample count: {msg_count}")
+            st.success(f"✅ Messages accessible (sample: {msg_count} messages)")
+        else:
+            error_msg = f"Messages not accessible: {resp.status_code}"
+            logger.error(f"{error_msg} - {resp.text[:200]}")
+            results["errors"].append(error_msg)
+            st.error(f"❌ Cannot access messages: {resp.status_code} - {resp.text[:200]}")
+    except Exception as e:
+        error_msg = f"Messages check failed: {str(e)}"
+        logger.error(error_msg)
+        results["errors"].append(error_msg)
+        st.error(f"❌ Messages check error: {str(e)}")
+    
+    logger.info(f"Validation complete. Results: {results}")
+    return results
+
+def fetch_replies_done(headers: Dict[str, str], team_id: str, channel_id: str, message_id: str, 
+                       delay_ms: int = 50, max_retries: int = 3) -> tuple[Optional[Dict[str, Any]], bool]:
+    """Fetch replies to check for 'done' messages. Returns (reply_data, had_error)."""
+    # URL encode the channel ID
+    encoded_channel_id = quote(channel_id, safe='')
+    url = f"https://graph.microsoft.com/v1.0/teams/{team_id}/channels/{encoded_channel_id}/messages/{message_id}/replies"
     done_pattern = re.compile(r'\bdone\b', re.IGNORECASE)
+    had_error = False
 
     try:
         while url:
-            resp = requests.get(url, headers=headers)
-            if resp.status_code == 404:
-                return None
-            if resp.status_code != 200:
-                return None
+            # Add delay to avoid rate limiting
+            time.sleep(delay_ms / 1000.0)
+            
+            # Retry logic for rate limiting
+            for attempt in range(max_retries):
+                resp = requests.get(url, headers=headers)
+                
+                if resp.status_code == 429:  # Too Many Requests
+                    retry_after = int(resp.headers.get('Retry-After', 2))
+                    logger.warning(f"Rate limit hit on replies for message {message_id}. Waiting {retry_after}s")
+                    time.sleep(retry_after)
+                    continue
+                    
+                if resp.status_code == 404:
+                    logger.debug(f"No replies found for message {message_id}")
+                    return None, False
+                    
+                if resp.status_code == 400:
+                    # BadRequest errors on replies - skip this message silently
+                    logger.warning(f"BadRequest (400) fetching replies for message {message_id}, skipping")
+                    return None, True  # Mark as error
+                    
+                if resp.status_code != 200:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Failed to fetch replies (attempt {attempt+1}/{max_retries}): {resp.status_code}")
+                        time.sleep(1)  # Wait 1 second before retry
+                        continue
+                    logger.error(f"Failed to fetch replies after {max_retries} attempts: {resp.status_code}")
+                    return None, True  # Mark as error
+                
+                break  # Success, exit retry loop
             
             data = resp.json()
             replies = data.get("value", [])
             
             if not replies:
-                return None
+                return None, False
 
             for reply in replies:
                 content = reply.get("body", {}).get("content", "") or ""
                 if done_pattern.search(content):
                     user = reply.get("from", {}).get("user", {}).get("displayName", "Unknown")
                     created = reply.get("createdDateTime", "")
+                    logger.info(f"Found 'done' reply for message {message_id} by {user}")
                     return {
                         "user": user,
                         "content": content,
                         "createdDateTime": created
-                    }
+                    }, False
 
             url = data.get('@odata.nextLink')
-        return None
-    except Exception:
-        return None
+        return None, False
+    except Exception as e:
+        logger.error(f"Error fetching replies for message {message_id}: {str(e)}")
+        return None, True
 
-def fetch_channel_messages(headers: Dict[str, str], team_id: str, channel_id: str, progress_bar=None) -> pd.DataFrame:
+def fetch_channel_messages(headers: Dict[str, str], team_id: str, channel_id: str, 
+                          progress_bar=None, delay_ms: int = 50, max_retries: int = 3, max_messages: int = 200) -> pd.DataFrame:
     """Fetch messages from Teams channel and return as DataFrame."""
-    url = f"https://graph.microsoft.com/v1.0/teams/{team_id}/channels/{channel_id}/messages"
+    logger.info(f"Starting to fetch messages from Team: {team_id[:8]}..., Channel: {channel_id[:20]}...")
+    logger.info(f"Using delay: {delay_ms}ms, max retries: {max_retries}, max messages: {max_messages}")
+    
+    # URL encode the channel ID to handle special characters
+    encoded_channel_id = quote(channel_id, safe='')
+    # Use $top parameter to get more messages per page (orderby is not supported)
+    url = f"https://graph.microsoft.com/v1.0/teams/{team_id}/channels/{encoded_channel_id}/messages?$top=50"
     rows = []
     page_count = 0
+    error_count = 0
     
-    while url:
+    # Validate IDs format
+    st.info(f"📡 Attempting to fetch from Team ID: {team_id[:8]}... | Channel ID: {channel_id[:20]}...")
+    st.info(f"🔗 Encoded Channel ID: {encoded_channel_id[:40]}...")
+    st.info(f"⏱️ Using {delay_ms}ms delay between requests, fetching up to {max_messages} messages")
+    
+    while url and len(rows) < max_messages:
         try:
-            resp = requests.get(url, headers=headers)
-            if resp.status_code != 200:
-                st.error(f"Graph API error: {resp.status_code}, {resp.text}")
-                break
+            # Add delay to avoid rate limiting
+            time.sleep(delay_ms / 1000.0)
+            
+            # Retry logic for rate limiting
+            for attempt in range(max_retries):
+                logger.debug(f"Fetching messages page {page_count + 1}, attempt {attempt + 1}")
+                resp = requests.get(url, headers=headers)
+                
+                if resp.status_code == 429:  # Too Many Requests
+                    retry_after = int(resp.headers.get('Retry-After', 2))
+                    logger.warning(f"Rate limit hit. Waiting {retry_after} seconds...")
+                    st.warning(f"⚠️ Rate limit hit. Waiting {retry_after} seconds...")
+                    time.sleep(retry_after)
+                    continue
+                
+                if resp.status_code != 200:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Request failed (attempt {attempt + 1}/{max_retries}): {resp.status_code}")
+                        st.warning(f"⚠️ Request failed (attempt {attempt + 1}/{max_retries}). Retrying...")
+                        time.sleep(1)
+                        continue
+                    
+                    error_detail = resp.json() if resp.text else {}
+                    error_msg = error_detail.get('error', {}).get('message', 'Unknown error')
+                    error_code = error_detail.get('error', {}).get('code', 'Unknown')
+                    
+                    logger.error(f"Graph API Error: {resp.status_code}, Code: {error_code}, Message: {error_msg}")
+                    st.error(f"❌ Graph API Error ({resp.status_code})")
+                    st.error(f"Code: {error_code}")
+                    st.error(f"Message: {error_msg}")
+                    st.warning("💡 Common fixes:")
+                    st.markdown("- Verify Team ID and Channel ID are correct")
+                    st.markdown("- Check API permissions include: `ChannelMessage.Read.All` or `Group.Read.All`")
+                    st.markdown("- Ensure the app has admin consent in Azure AD")
+                    st.markdown("- Try URL encoding the Channel ID if it contains special characters")
+                    
+                    # Try alternative endpoint
+                    st.info("🔄 Tip: Try using Graph Explorer to verify your IDs:")
+                    st.code(f"https://developer.microsoft.com/en-us/graph/graph-explorer")
+                    return pd.DataFrame(rows)
+                
+                break  # Success, exit retry loop
 
             data = resp.json()
             messages = data.get("value", [])
+            logger.info(f"Fetched page {page_count + 1} with {len(messages)} messages")
             
             for msg in messages:
+                # Check if we've reached the max limit
+                if len(rows) >= max_messages:
+                    logger.info(f"Reached max message limit of {max_messages}")
+                    break
+                    
+                # Add delay to avoid rate limiting when fetching replies
+                time.sleep(delay_ms / 1000.0)
+                
                 # Safe sender extraction
                 from_user = msg.get("from")
                 if from_user and "user" in from_user:
@@ -116,7 +305,11 @@ def fetch_channel_messages(headers: Dict[str, str], team_id: str, channel_id: st
                     sender = "System or Unknown"
 
                 # Get replies to check for task completion
-                replies_done = fetch_replies_done(headers, team_id, channel_id, msg.get("id", ""))
+                replies_done, had_error = fetch_replies_done(headers, team_id, channel_id, msg.get("id", ""), 
+                                                  delay_ms, max_retries)
+                if had_error:
+                    error_count += 1
+                    
                 task_done = replies_done.get("createdDateTime") if replies_done else None
 
                 # Message content
@@ -192,14 +385,38 @@ def fetch_channel_messages(headers: Dict[str, str], team_id: str, channel_id: st
             url = data.get("@odata.nextLink")
             page_count += 1
             
+            # Stop if we've reached max messages
+            if len(rows) >= max_messages:
+                logger.info(f"Stopping fetch - reached max message limit of {max_messages}")
+                break
+            
+            # Add delay between pages to avoid rate limiting
+            if url:
+                time.sleep(delay_ms / 1000.0)
+                logger.debug(f"Moving to next page. Total messages so far: {len(rows)}")
+            
             if progress_bar:
                 progress_bar.progress(min(page_count * 10, 90))  # Approximate progress
                 
         except Exception as e:
+            logger.error(f"Error fetching messages: {str(e)}", exc_info=True)
             st.error(f"Error fetching messages: {str(e)}")
             break
 
-    return pd.DataFrame(rows)
+    logger.info(f"Completed fetching. Total messages: {len(rows)}, Total pages: {page_count}")
+    
+    if error_count > 0:
+        logger.warning(f"Encountered {error_count} errors while fetching reply data (these messages will not have completion times)")
+        st.warning(f"⚠️ {error_count} message(s) had errors fetching reply data (BadRequest/rate limit). These messages will not show completion times.")
+    
+    # Convert to DataFrame and sort by date (newest first)
+    df = pd.DataFrame(rows)
+    if not df.empty and 'Date' in df.columns:
+        df['Date'] = pd.to_datetime(df['Date'])
+        df = df.sort_values('Date', ascending=False).reset_index(drop=True)
+        logger.info(f"Sorted messages by date. Date range: {df['Date'].min()} to {df['Date'].max()}")
+    
+    return df
 
 def create_summary_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Create summary statistics from the messages DataFrame."""
@@ -246,27 +463,61 @@ def filter_dataframe(df: pd.DataFrame, date_from: date = None, date_to: date = N
         df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
         filtered_df = df.copy()
         
+        # Debug info
+        logger.info(f"Filtering data - Original count: {len(df)}, Date range: {date_from} to {date_to}, Show all: {show_all}")
+        
+        # Show date range of actual data
+        min_date = df['Date'].min()
+        max_date = df['Date'].max()
+        logger.info(f"Data date range: {min_date} to {max_date}")
+        
+        # Count messages by month
+        df['YearMonth'] = df['Date'].dt.to_period('M')
+        month_counts = df.groupby('YearMonth').size().sort_index()
+        
+        st.write(f"🔍 Debug Info:")
+        st.write(f"- Original message count: {len(df)}")
+        st.write(f"- Data date range: {min_date.strftime('%Y-%m-%d %H:%M')} to {max_date.strftime('%Y-%m-%d %H:%M')}")
+        st.write(f"- Messages by month:")
+        for month, count in month_counts.items():
+            st.write(f"  • {month}: {count} messages")
+        st.write(f"- Filter range: {date_from} to {date_to}")
+        st.write(f"- Show all messages: {show_all}")
+        
+        filtered_df = df.copy()
+        
         # Apply date filters if not showing all messages
         if not show_all and date_from and date_to:
             filter_date_from = pd.to_datetime(date_from)
             filter_date_to = pd.to_datetime(date_to) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)  # End of day
             
+            st.write(f"- Applying filter: {filter_date_from} to {filter_date_to}")
+            
             filtered_df = filtered_df[
                 (filtered_df["Date"] >= filter_date_from) &
                 (filtered_df["Date"] <= filter_date_to)
             ]
+            
+            logger.info(f"After date filter: {len(filtered_df)} messages")
+            st.write(f"- Messages after date filter: {len(filtered_df)}")
+            
         elif not show_all and date_from:
             filter_date_from = pd.to_datetime(date_from)
             filtered_df = filtered_df[filtered_df["Date"] >= filter_date_from]
+            logger.info(f"After from-date filter: {len(filtered_df)} messages")
+            st.write(f"- Messages after from-date filter: {len(filtered_df)}")
         
         # Apply sender filter
         if sender_filter:
             filtered_df = filtered_df[
                 filtered_df["Sender"].str.contains(sender_filter, case=False, na=False)
             ]
+            logger.info(f"After sender filter '{sender_filter}': {len(filtered_df)} messages")
+            st.write(f"- Messages after sender filter: {len(filtered_df)}")
             
         return filtered_df
     except Exception as e:
+        logger.error(f"Error filtering data: {str(e)}", exc_info=True)
         st.error(f"Error filtering data: {str(e)}")
         return df
 
@@ -370,6 +621,10 @@ def post_to_jira(df: pd.DataFrame, jira_url: str, jira_email: str, jira_token: s
 
 # ====== STREAMLIT APP ======
 def main():
+    logger.info("="*50)
+    logger.info("Teams Message Fetcher App Started")
+    logger.info("="*50)
+    
     st.title("💬 Teams Message Fetcher")
     st.markdown("Fetch and analyze Microsoft Teams channel messages with ease!")
     
@@ -384,20 +639,79 @@ def main():
     with st.sidebar.expander("📊 Teams Configuration", expanded=True):
         team_id = st.text_input("Team ID", value="22e6688f-a1d9-4d15-9103-a1ec37194022")
         channel_id = st.text_input("Channel ID", value="19:27f5773cb5f74f5488e03320cbcf447c@thread.tacv2")
+        
+        # Test connection button
+        if st.button("🔍 Test Connection", use_container_width=True):
+            if not all([tenant_id, client_id, client_secret, team_id, channel_id]):
+                st.error("Please fill in all authentication and Teams configuration fields first.")
+            else:
+                with st.spinner("Testing connection..."):
+                    token = get_access_token(tenant_id, client_id, client_secret)
+                    if token:
+                        headers = get_graph_headers(token)
+                        validate_teams_access(headers, team_id, channel_id)
+    
+    with st.sidebar.expander("📋 View Logs", expanded=False):
+        if st.button("🔄 Refresh Logs", use_container_width=True):
+            if os.path.exists('teams_fetcher.log'):
+                with open('teams_fetcher.log', 'r') as f:
+                    log_lines = f.readlines()
+                    # Show last 50 lines
+                    recent_logs = ''.join(log_lines[-50:])
+                    st.text_area("Recent Logs (last 50 lines)", recent_logs, height=300)
+            else:
+                st.info("No log file found yet")
+        
+        if st.button("🗑️ Clear Logs", use_container_width=True):
+            if os.path.exists('teams_fetcher.log'):
+                open('teams_fetcher.log', 'w').close()
+                logger.info("Log file cleared by user")
+                st.success("Logs cleared!")
+    
+    with st.sidebar.expander("⚙️ Advanced Settings", expanded=False):
+        max_messages = st.number_input(
+            "Max Messages to Fetch",
+            min_value=10,
+            max_value=1000,
+            value=200,
+            step=10,
+            help="Maximum number of messages to fetch (newest first)"
+        )
+        request_delay = st.slider(
+            "Request Delay (ms)",
+            min_value=0,
+            max_value=500,
+            value=100,
+            step=10,
+            help="Delay between API requests to avoid rate limiting. Increase if you get errors."
+        )
+        retry_attempts = st.number_input(
+            "Retry Attempts",
+            min_value=1,
+            max_value=5,
+            value=3,
+            help="Number of times to retry failed requests"
+        )
     
     with st.sidebar.expander("🔍 Filters", expanded=True):
+        # Show all messages option - MOVED TO TOP for visibility
+        show_all_messages = st.checkbox("Show all messages (ignore date filter)", value=False)
+        
         # Date range filter
         col1, col2 = st.columns(2)
         with col1:
-            date_from = st.date_input("From date", value=date(2024, 1, 1))
+            date_from = st.date_input("From date", value=date(2024, 9, 1), disabled=show_all_messages)
         with col2:
-            date_to = st.date_input("To date", value=date.today())
+            date_to = st.date_input("To date", value=date(2024, 9, 30), disabled=show_all_messages)
+        
+        # Show current filter info
+        if show_all_messages:
+            st.warning("⚠️ Date filter is DISABLED - showing ALL messages")
+        else:
+            st.info(f"📅 Current filter: {date_from.strftime('%Y-%m-%d')} to {date_to.strftime('%Y-%m-%d')}")
         
         # Sender filter
         sender_filter = st.text_input("Filter by sender (optional)", placeholder="e.g., Ali Murtadho")
-        
-        # Show all messages option
-        show_all_messages = st.checkbox("Show all messages (ignore date filter)", value=False)
     
     with st.sidebar.expander("🎫 Jira Integration (Optional)", expanded=False):
         enable_jira = st.checkbox("Enable Jira Integration")
@@ -441,7 +755,8 @@ def main():
             
             with st.spinner("Fetching messages from Teams channel..."):
                 progress_bar = st.progress(0)
-                messages_df = fetch_channel_messages(headers, team_id, channel_id, progress_bar)
+                messages_df = fetch_channel_messages(headers, team_id, channel_id, progress_bar, 
+                                                     request_delay, retry_attempts, max_messages)
                 progress_bar.progress(100)
             
             if not messages_df.empty:
@@ -542,11 +857,17 @@ def main():
             (st.session_state.messages_df["Sender"].isin(selected_senders))
         ].head(max_rows)
         
+        # Add Month/Year column for easier viewing
+        if not display_df.empty and 'Date' in display_df.columns:
+            display_df = display_df.copy()
+            display_df['Month'] = pd.to_datetime(display_df['Date']).dt.strftime('%Y-%m')
+        
         # Display table
         st.dataframe(
             display_df,
             use_container_width=True,
             column_config={
+                "Month": st.column_config.TextColumn("Month", width="small"),
                 "Date": st.column_config.DatetimeColumn("Date", format="DD/MM/YYYY HH:mm"),
                 "EstimatedHours": st.column_config.NumberColumn("Hours", format="%.1f"),
                 "Message": st.column_config.TextColumn("Message", width="large")
